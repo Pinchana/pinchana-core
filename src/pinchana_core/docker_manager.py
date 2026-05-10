@@ -3,10 +3,11 @@
 import logging
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,8 @@ class ContainerModule:
     enabled: bool
     source_type: str          # 'git' or 'local'
     source_url: str           # git URL or local path
+    route_patterns: list[str] = field(default_factory=list)
+    endpoint: str = ""        # HTTP endpoint e.g. http://localhost:8081
     dockerfile: str = "Dockerfile"
     port: int = 8080
     image_tag: Optional[str] = None
@@ -27,6 +30,77 @@ class ContainerModule:
     network: str = "container:gluetun"
     cache_volume: str = "scraper-cache"
     env: dict | None = None
+
+
+class ContainerRegistry:
+    """Read-only registry of pre-started container modules.
+
+    Unlike ModuleContainerManager, this does NOT build or start containers.
+    It reads the YAML config and assumes modules are already running
+    (e.g. managed by docker-compose or Kubernetes).
+    """
+
+    def __init__(self, config_path: str | None = None):
+        self.config_path = config_path or os.getenv(
+            "MODULES_CONFIG", "/app/config/modules.yaml"
+        )
+        self.modules: dict[str, ContainerModule] = {}
+        self._load_config()
+
+    def _load_config(self) -> None:
+        if not Path(self.config_path).exists():
+            logger.warning("Module config not found: %s", self.config_path)
+            return
+
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        for name, cfg in data.get("modules", {}).items():
+            if not cfg.get("enabled", False):
+                continue
+            source = cfg.get("source", {})
+            container = cfg.get("container", {})
+            endpoint = container.get("endpoint", f"http://localhost:{container.get('port', 8080)}")
+            self.modules[name] = ContainerModule(
+                name=name,
+                enabled=True,
+                source_type=source.get("type", "local"),
+                source_url=source.get("url") or source.get("path", ""),
+                route_patterns=cfg.get("route_patterns", []),
+                endpoint=endpoint,
+                dockerfile=container.get("dockerfile", "Dockerfile"),
+                port=container.get("port", 8080),
+                image_tag=container.get("image_tag", f"pinchana-module-{name}"),
+                container_name=container.get("name", f"pinchana-{name}"),
+                network=container.get("network", "container:gluetun"),
+                cache_volume=container.get("cache_volume", "scraper-cache"),
+                env=container.get("env", {}),
+            )
+        logger.info("Loaded %d container modules from config", len(self.modules))
+
+    async def health(self, name: str) -> dict:
+        """HTTP health check against the module's /health endpoint."""
+        module = self.modules.get(name)
+        if not module:
+            return {"status": "not_configured"}
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{module.endpoint}/health")
+                resp.raise_for_status()
+                return {"status": "healthy", "detail": resp.json()}
+        except Exception as e:
+            return {"status": "unhealthy", "detail": str(e)}
+
+    def list_modules(self) -> dict[str, dict]:
+        """Return a snapshot of all configured modules."""
+        return {
+            name: {
+                "endpoint": m.endpoint,
+                "patterns": m.route_patterns,
+            }
+            for name, m in self.modules.items()
+        }
 
 
 class ModuleContainerManager:
@@ -57,11 +131,14 @@ class ModuleContainerManager:
                 continue
             source = cfg.get("source", {})
             container = cfg.get("container", {})
+            endpoint = container.get("endpoint", f"http://localhost:{container.get('port', 8080)}")
             self.modules[name] = ContainerModule(
                 name=name,
                 enabled=True,
                 source_type=source.get("type", "local"),
                 source_url=source.get("url") or source.get("path", ""),
+                route_patterns=cfg.get("route_patterns", []),
+                endpoint=endpoint,
                 dockerfile=container.get("dockerfile", "Dockerfile"),
                 port=container.get("port", 8080),
                 image_tag=container.get("image_tag", f"pinchana-module-{name}"),
@@ -159,7 +236,7 @@ class ModuleContainerManager:
 
         # All module containers share the same network namespace (gluetun)
         # so the server (also on that namespace) can reach them via localhost.
-        endpoint = f"http://localhost:{module.port}"
+        endpoint = module.endpoint or f"http://localhost:{module.port}"
         
         self.running[name] = {
             "container": module.container_name,
