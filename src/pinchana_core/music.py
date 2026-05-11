@@ -163,7 +163,7 @@ class MusicDownloader:
                 )
                 if info:
                     # Find downloaded file
-                    for ext in (".m4a", ".mp4", ".webm", ".opus", ".ogg", ".flac", ".wav", ".aac"):
+                    for ext in (".m4a", ".mp3", ".mp4", ".webm", ".opus", ".ogg", ".flac", ".wav", ".aac"):
                         candidate = post_dir / f"raw{ext}"
                         if candidate.exists() and candidate.stat().st_size > 0:
                             return candidate
