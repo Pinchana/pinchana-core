@@ -42,12 +42,15 @@ class MusicDownloader:
     # yt-dlp format: best audio-only stream, fallback to best combined
     YTDLP_FORMAT = "ba/b"
 
-    # Multi-strategy fallback for YouTube-based sources
+    # yt-dlp default clients (2026.03+) are already tuned by maintainers:
+    # tv, ios, web_safari, web_creator, android_vr
+    # We do NOT override player_client — we just provide cookies when available.
+    # Strategies ordered by reliability for audio extraction:
     YTDLP_STRATEGIES = [
-        {"name": "android_cookies", "client": ["android", "web"], "cookies": True},
-        {"name": "android_nocookies", "client": ["android", "web"], "cookies": False},
-        {"name": "ios", "client": ["ios"], "cookies": False},
-        {"name": "web_cookies", "client": [], "cookies": True},
+        {"name": "default_cookies", "override_client": False, "cookies": True},
+        {"name": "default_nocookies", "override_client": False, "cookies": False},
+        {"name": "tv_cookies", "override_client": True, "client": ["tv"], "cookies": True},
+        {"name": "android_vr", "override_client": True, "client": ["android_vr"], "cookies": False},
     ]
 
     def __init__(self, base_dir: str | Path, proxy: str | None = None):
@@ -139,9 +142,11 @@ class MusicDownloader:
                 "prefer_ffmpeg": True,
                 "retries": 2,
                 "fragment_retries": 2,
+                "format_sort": ["quality", "br", "asr", "size"],
+                "format_sort_force": True,
             }
 
-            if strategy.get("client"):
+            if strategy.get("override_client") and strategy.get("client"):
                 opts["extractor_args"] = {
                     "youtube": {"player_client": strategy["client"]}
                 }
