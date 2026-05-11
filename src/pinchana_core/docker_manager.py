@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,37 @@ import httpx
 import yaml
 
 logger = logging.getLogger(__name__)
+
+_ENV_VAR_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?}")
+
+
+def _expand_env_string(value: str) -> str:
+    """Expand ${VAR} and ${VAR:-default} placeholders in a string."""
+
+    def repl(match: re.Match[str]) -> str:
+        name = match.group("name")
+        default = match.group("default")
+        return os.getenv(name, default if default is not None else "")
+
+    return _ENV_VAR_RE.sub(repl, value)
+
+
+def _expand_env_tree(value):
+    """Recursively expand env placeholders in nested YAML data structures."""
+    if isinstance(value, str):
+        return _expand_env_string(value)
+    if isinstance(value, list):
+        return [_expand_env_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _expand_env_tree(v) for k, v in value.items()}
+    return value
+
+
+def _to_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -53,14 +85,15 @@ class ContainerRegistry:
             return
 
         with open(self.config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = _expand_env_tree(yaml.safe_load(f) or {})
 
         for name, cfg in data.get("modules", {}).items():
             if not cfg.get("enabled", False):
                 continue
             source = cfg.get("source", {})
             container = cfg.get("container", {})
-            endpoint = container.get("endpoint", f"http://localhost:{container.get('port', 8080)}")
+            port = _to_int(container.get("port", 8080), 8080)
+            endpoint = container.get("endpoint", f"http://localhost:{port}")
             self.modules[name] = ContainerModule(
                 name=name,
                 enabled=True,
@@ -69,9 +102,9 @@ class ContainerRegistry:
                 route_patterns=cfg.get("route_patterns", []),
                 endpoint=endpoint,
                 dockerfile=container.get("dockerfile", "Dockerfile"),
-                port=container.get("port", 8080),
+                port=port,
                 image_tag=container.get("image_tag", f"pinchana-module-{name}"),
-                container_name=container.get("name", f"pinchana-{name}"),
+                container_name=container.get("container_name") or container.get("name") or f"pinchana-{name}",
                 network=container.get("network", "container:gluetun"),
                 cache_volume=container.get("cache_volume", "scraper-cache"),
                 env=container.get("env", {}),
@@ -124,14 +157,15 @@ class ModuleContainerManager:
             return
 
         with open(self.config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = _expand_env_tree(yaml.safe_load(f) or {})
 
         for name, cfg in data.get("modules", {}).items():
             if not cfg.get("enabled", False):
                 continue
             source = cfg.get("source", {})
             container = cfg.get("container", {})
-            endpoint = container.get("endpoint", f"http://localhost:{container.get('port', 8080)}")
+            port = _to_int(container.get("port", 8080), 8080)
+            endpoint = container.get("endpoint", f"http://localhost:{port}")
             self.modules[name] = ContainerModule(
                 name=name,
                 enabled=True,
@@ -140,9 +174,9 @@ class ModuleContainerManager:
                 route_patterns=cfg.get("route_patterns", []),
                 endpoint=endpoint,
                 dockerfile=container.get("dockerfile", "Dockerfile"),
-                port=container.get("port", 8080),
+                port=port,
                 image_tag=container.get("image_tag", f"pinchana-module-{name}"),
-                container_name=container.get("name", f"pinchana-{name}"),
+                container_name=container.get("container_name") or container.get("name") or f"pinchana-{name}",
                 network=container.get("network", "container:gluetun"),
                 cache_volume=container.get("cache_volume", "scraper-cache"),
                 env=container.get("env", {}),
