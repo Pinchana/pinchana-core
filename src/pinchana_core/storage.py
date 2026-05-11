@@ -29,6 +29,12 @@ class MediaStorage:
     def video_path(self, shortcode: str) -> Path:
         return self._post_dir(shortcode) / "video.mp4"
 
+    def audio_path(self, shortcode: str) -> Path:
+        return self._post_dir(shortcode) / "audio.mp3"
+
+    def cover_path(self, shortcode: str) -> Path:
+        return self._post_dir(shortcode) / "cover.jpg"
+
     def carousel_thumbnail_path(self, shortcode: str, index: int) -> Path:
         return self._post_dir(shortcode) / "carousel" / f"{index}_thumbnail.jpg"
 
