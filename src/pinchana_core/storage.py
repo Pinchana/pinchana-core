@@ -65,15 +65,15 @@ class MediaStorage:
 
     async def download(self, url: str, dest: Path) -> bool:
         client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+        }
+        if "instagram.com" in url:
+            headers["Referer"] = "https://www.instagram.com/"
+
         try:
-            resp = await client.get(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Referer": "https://www.instagram.com/",
-                    "Accept": "*/*",
-                },
-            )
+            resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             dest.parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as f:
