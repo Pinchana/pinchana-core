@@ -24,6 +24,8 @@ import aiohttp
 from PIL import Image
 from yt_dlp import YoutubeDL
 
+from .vpn import GluetunController, VpnRotationError
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,11 +34,38 @@ class MusicDownloadError(Exception):
     pass
 
 
+class RateLimitError(Exception):
+    """Raised when the source platform blocks the request (403/429/timeout).
+
+    MusicDownloader.download() catches this to trigger VPN rotation before
+    retrying. Subclasses' resolve() should raise this on IP-block indicators
+    instead of letting the underlying library exception propagate uncaught.
+    """
+    pass
+
+
+def _is_rate_limited(e: Exception) -> bool:
+    """Heuristic: does this exception indicate an IP block / rate limit?"""
+    msg = str(e).lower()
+    return any(
+        x in msg
+        for x in (
+            "403", "429", "rate limit", "too many requests",
+            "blocked", "forbidden", "captcha", "verify",
+            "timeout", "timed out", "connection",
+        )
+    )
+
+
 class MusicDownloader:
     """Base downloader for audio extraction via yt-dlp + ffmpeg MP3 conversion.
 
     Subclasses must implement:
         - `resolve(url: str)` -> tuple[download_url_or_id, metadata_dict]
+
+    The base ``download()`` wraps the pipeline in a 3-attempt retry loop that
+    triggers ``gluetun.rotate_ip()`` on :class:`RateLimitError`, so an IP
+    block no longer surfaces as an unhandled 500.
     """
 
     # yt-dlp format: best audio-only stream, fallback to best combined
@@ -53,11 +82,17 @@ class MusicDownloader:
         {"name": "android_vr", "override_client": True, "client": ["android_vr"], "cookies": False},
     ]
 
-    def __init__(self, base_dir: str | Path, proxy: str | None = None):
+    def __init__(
+        self,
+        base_dir: str | Path,
+        proxy: str | None = None,
+        gluetun: GluetunController | None = None,
+    ):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.proxy = proxy
         self.cookies_path = self._find_cookies()
+        self.gluetun = gluetun or GluetunController()
 
     # ------------------------------------------------------------------
     # Subclass hooks
@@ -75,15 +110,51 @@ class MusicDownloader:
     # Shared pipeline
     # ------------------------------------------------------------------
     async def download(self, url: str) -> tuple[Path, dict]:
-        """Full pipeline: resolve → yt-dlp download → MP3 conversion.
+        """Full pipeline with retry-on-rate-limit: resolve → download → MP3.
 
-        Returns:
-            (mp3_path, metadata_dict)
+        Wraps :meth:`_download_pipeline` in a 3-attempt retry loop. On
+        :class:`RateLimitError` (or any third-party exception that looks like
+        an IP block) the VPN IP is rotated before retrying, so a blocked exit
+        IP no longer surfaces as an unhandled 500. :class:`MusicDownloadError`
+        is re-raised immediately — it signals a permanent failure (bad URL,
+        missing metadata) that retries cannot fix.
         """
-        target, meta = await self.resolve(url)
-        if not target:
-            raise MusicDownloadError(f"Could not resolve URL: {url}")
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                return await self._download_pipeline(url)
+            except MusicDownloadError:
+                raise
+            except RateLimitError as e:
+                last_error = e
+                logger.warning("Attempt %d rate-limited: %s", attempt, e)
+                if attempt < 3:
+                    await self._rotate_and_sleep()
+            except Exception as e:
+                last_error = e
+                if _is_rate_limited(e):
+                    logger.warning("Attempt %d looks rate-limited: %s", attempt, e)
+                    if attempt < 3:
+                        await self._rotate_and_sleep()
+                else:
+                    logger.error("Attempt %d failed (non-retryable): %s", attempt, e)
+                    raise
+        raise MusicDownloadError(f"Rate-limited after 3 attempts: {last_error}")
 
+    async def _rotate_and_sleep(self) -> None:
+        """Rotate the VPN IP, then sleep to let the tunnel stabilize."""
+        if self.gluetun:
+            try:
+                await self.gluetun.rotate_ip()
+            except VpnRotationError as e:
+                logger.warning("VPN rotation failed: %s", e)
+                await asyncio.sleep(30)
+                return
+        await asyncio.sleep(5)
+
+    async def _download_pipeline(self, url: str) -> tuple[Path, dict]:
+        """Resolve → yt-dlp download → MP3 conversion (the un-retried body)."""
+        target, meta = await self.resolve(url)
         post_id = meta.get("id") or self._slugify(meta.get("title", "track"))
         post_dir = self.base_dir / post_id
         post_dir.mkdir(parents=True, exist_ok=True)
@@ -91,7 +162,10 @@ class MusicDownloader:
         # 1. Download raw audio
         raw_audio = await self._ytdlp_download(target, post_dir)
         if not raw_audio:
-            raise MusicDownloadError(f"yt-dlp failed for {target}")
+            # yt-dlp returns None only when every strategy raised; treat as
+            # a likely IP block rather than a permanent MusicDownloadError,
+            # so the retry loop above can rotate and try again.
+            raise RateLimitError(f"yt-dlp could not extract {target}")
 
         # 2. Download cover art
         cover_path = None
