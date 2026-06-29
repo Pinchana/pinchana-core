@@ -41,7 +41,12 @@ class GluetunController:
         try:
             resp = await client.get("/v1/vpn/status")
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise VpnRotationError(
+                    f"Gluetun /v1/vpn/status returned non-dict JSON ({type(data).__name__}): {data!r}"
+                )
+            return data
         finally:
             await client.aclose()
 
@@ -51,7 +56,9 @@ class GluetunController:
         try:
             resp = await client.get("/v1/publicip/ip")
             if resp.status_code == 200:
-                return resp.json().get("public_ip")
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data.get("public_ip")
             return None
         except Exception:
             return None
@@ -82,6 +89,8 @@ class GluetunController:
                 logger.debug("Gluetun control server not reachable yet.")
             except httpx.HTTPError as e:
                 logger.debug(f"Error polling VPN status: {e}")
+            except VpnRotationError as e:
+                logger.debug(f"VPN rotation polling issue: {e}")
             await asyncio.sleep(interval)
         raise VpnRotationError(
             f"VPN failed to connect within {timeout}s after rotation — possible transient AUTH_FAILED"
