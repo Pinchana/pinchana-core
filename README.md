@@ -1,5 +1,8 @@
 # 📦 Pinchana Core
 
+> [!WARNING]
+> The Live Photo implementation on this branch currently does not work at all. It is exploration and experimentation for TikTok Live Photo scraping behavior, not production-ready functionality.
+
 **Pinchana Core** is the foundational shared library for the Pinchana scraping ecosystem. it provides shared models, storage management, VPN control, and Docker orchestration logic used by both the gateway and the individual scraper modules.
 
 ---

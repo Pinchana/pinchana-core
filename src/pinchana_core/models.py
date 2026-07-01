@@ -1,10 +1,12 @@
 from pydantic import BaseModel, HttpUrl, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 class ScrapeRequest(BaseModel):
     """Client payload specifying the target URL."""
     url: HttpUrl = Field(..., description="The complete Instagram Post, Reel, or Carousel URL.")
+    debug_json: bool = Field(False, description="Save scraper raw/debug JSON when supported.")
+    force_refresh: bool = Field(False, description="Bypass cached metadata and re-scrape when supported.")
 
 
 class MediaItem(BaseModel):
@@ -38,3 +40,6 @@ class ScrapeResponse(BaseModel):
     album: Optional[str] = None
     carousel: Optional[List[MediaItem]] = None
     tracklist: Optional[List[TrackItem]] = None
+    available: Optional[bool] = None
+    reason: Optional[str] = None
+    debug_json_urls: Optional[Dict[str, str]] = None
