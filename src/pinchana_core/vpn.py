@@ -19,6 +19,7 @@ class GluetunController:
     ROTATION_COOLDOWN = 90  # seconds
 
     def __init__(self, control_url: Optional[str] = None, api_key: Optional[str] = None):
+        self.enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
         self.control_url = control_url or os.getenv("GLUETUN_CONTROL_URL", "http://localhost:8000")
         self.api_key = api_key or os.getenv("GLUETUN_API_KEY", "secret-key")
         self._last_rotation = 0.0
@@ -37,6 +38,8 @@ class GluetunController:
 
     async def get_vpn_status(self) -> dict:
         """Fetch current VPN status from Gluetun."""
+        if not self.enabled:
+            return {"status": "disabled", "enabled": False}
         client = self._client()
         try:
             resp = await client.get("/v1/vpn/status")
@@ -52,6 +55,8 @@ class GluetunController:
 
     async def get_public_ip(self) -> Optional[str]:
         """Fetch current public IP from Gluetun."""
+        if not self.enabled:
+            return None
         client = self._client()
         try:
             resp = await client.get("/v1/publicip/ip")
@@ -67,6 +72,8 @@ class GluetunController:
 
     async def wait_for_connection(self, timeout: float = 60.0, interval: float = 2.0) -> dict:
         """Poll Gluetun until the VPN is connected or timeout expires."""
+        if not self.enabled:
+            return {"status": "disabled", "enabled": False}
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -98,6 +105,9 @@ class GluetunController:
 
     async def rotate_ip(self):
         """Teardown and rebuild the VPN tunnel, verifying it actually comes up."""
+        if not self.enabled:
+            logger.info("VPN rotation skipped because VPN_ENABLED=false")
+            return
         async with self._lock:
             now = time.time()
             elapsed = now - self._last_rotation
