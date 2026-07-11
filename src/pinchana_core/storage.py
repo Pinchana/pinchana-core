@@ -1,12 +1,16 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
+import time
+import uuid
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Awaitable, Callable, Optional, Dict, TypeVar
 import httpx
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class MediaStorage:
@@ -16,6 +20,49 @@ class MediaStorage:
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.max_size_bytes = int(max_size_gb * 1024 * 1024 * 1024)
+        self._http_client: httpx.AsyncClient | None = None
+        self._http_client_lock = asyncio.Lock()
+        self._download_limit = asyncio.Semaphore(
+            max(1, int(os.getenv("MEDIA_DOWNLOAD_CONCURRENCY", "4")))
+        )
+        self._inflight: dict[str, asyncio.Task] = {}
+        self._inflight_lock = asyncio.Lock()
+
+    async def _client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            async with self._http_client_lock:
+                if self._http_client is None:
+                    self._http_client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(120.0, connect=15.0),
+                        follow_redirects=True,
+                        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                    )
+        return self._http_client
+
+    async def close(self) -> None:
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    async def singleflight(self, key: str, operation: Callable[[], Awaitable[T]]) -> T:
+        """Run at most one operation for a cache key and share its result."""
+        async with self._inflight_lock:
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(operation())
+                self._inflight[key] = task
+                task.add_done_callback(
+                    lambda completed: asyncio.create_task(
+                        self._remove_inflight(key, completed)
+                    )
+                )
+
+        return await asyncio.shield(task)
+
+    async def _remove_inflight(self, key: str, task: asyncio.Task) -> None:
+        async with self._inflight_lock:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
 
     def _post_dir(self, shortcode: str) -> Path:
         return self.base_path / shortcode
@@ -54,8 +101,13 @@ class MediaStorage:
     def save_metadata(self, shortcode: str, metadata: Dict):
         post_dir = self._post_dir(shortcode)
         post_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._metadata_path(shortcode), "w", encoding="utf-8") as f:
+        target = self._metadata_path(shortcode)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        with open(temporary, "w", encoding="utf-8") as f:
             json.dump(metadata, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        temporary.replace(target)
 
     def prepare_post_dir(self, shortcode: str):
         post_dir = self._post_dir(shortcode)
@@ -64,7 +116,6 @@ class MediaStorage:
         post_dir.mkdir(parents=True, exist_ok=True)
 
     async def download(self, url: str, dest: Path) -> bool:
-        client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -72,18 +123,31 @@ class MediaStorage:
         if "instagram.com" in url:
             headers["Referer"] = "https://www.instagram.com/"
 
+        temporary = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.part")
+        started = time.perf_counter()
         try:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as f:
-                f.write(resp.content)
+            async with self._download_limit:
+                client = await self._client()
+                async with client.stream("GET", url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with open(temporary, "wb") as f:
+                        async for chunk in resp.aiter_bytes(128 * 1024):
+                            f.write(chunk)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    temporary.replace(dest)
+            logger.info(
+                "media_download_complete path=%s bytes=%d elapsed_ms=%.1f",
+                dest,
+                dest.stat().st_size,
+                (time.perf_counter() - started) * 1000,
+            )
             return True
         except Exception as e:
-            logger.error(f"Failed to download {url}: {e}")
+            logger.error("Failed to download %s: %s", url, e)
+            temporary.unlink(missing_ok=True)
             return False
-        finally:
-            await client.aclose()
 
     def _total_size(self) -> int:
         return sum(
