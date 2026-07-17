@@ -13,6 +13,7 @@ class MediaItem(BaseModel):
     media_type: str
     thumbnail_url: str
     video_url: Optional[str] = None
+    looping: bool = False
 
 
 class TrackItem(BaseModel):
