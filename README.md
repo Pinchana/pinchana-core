@@ -1,49 +1,33 @@
-# 📦 Pinchana Core
+# Pinchana Core
 
-**Pinchana Core** is the foundational shared library for the Pinchana scraping ecosystem. it provides shared models, storage management, VPN control, and Docker orchestration logic used by both the gateway and the individual scraper modules.
+Pinchana Core is the shared Python library used by the Pinchana gateway and platform modules. It provides common request and legacy response models, cache storage, music extraction helpers, VPN control, module lifecycle support, and the in-process plugin registry.
 
----
+## Main packages
 
-## ✨ Key Components
+- `pinchana_core.models` defines the shared Pydantic request and module response types.
+- `pinchana_core.storage` downloads media, resolves cache paths, and evicts the oldest post directories when the configured size limit is exceeded.
+- `pinchana_core.music` contains common behavior for the music platform modules.
+- `pinchana_core.vpn` checks and rotates the Gluetun connection.
+- `pinchana_core.docker_manager` reads module configuration and performs optional container lifecycle operations.
+- `pinchana_core.plugins` registers modules that run inside the gateway process during development.
 
-### 1. Models (`pinchana_core.models`)
-Defines the standard Pydantic v2 schemas for requests and responses, ensuring consistent data structures across all modules.
-- `ScrapeRequest`: Standardizes input URL and options.
-- `ScrapeResponse`: Uniform output format for media metadata.
-- `MediaItem`: Represents an individual image or video in a gallery.
+The gateway, rather than this package, converts module responses to the public API v1 `{data, meta}` contract.
 
-### 2. Storage (`pinchana_core.storage`)
-An intelligent file-based storage system with a **Global Media Cache**.
-- **LRU Eviction:** Automatically deletes the oldest media files when the cache exceeds a configurable size (e.g., 10GB).
-- **Download Helpers:** Concurrent downloading of media with retry logic.
-- **Path Resolution:** Standardized directory structure for cached media.
+## Development
 
-### 3. VPN Controller (`pinchana_core.vpn`)
-Provides an interface to interact with [Gluetun](https://github.com/qdm12/gluetun).
-- **Signal Rotation:** Triggers an immediate IP change via the Gluetun API.
-- **Health Checks:** Monitors the status of the VPN tunnel.
+Run commands from this directory:
 
-### 4. Docker Manager (`pinchana_core.docker_manager`)
-Handles the discovery and lifecycle of scraper modules running in Docker containers.
-- **Dynamic Discovery:** Reads `modules.yaml` to identify available scrapers and their route patterns.
-- **Lifecycle Control:** Can programmatically start, stop, or rebuild scraper containers.
-
-### 5. Plugin Registry (`pinchana_core.plugins`)
-A lightweight registry for "in-process" plugins, allowing modules to be imported directly into the server for easier development or single-binary deployments.
-
----
-
-## 🛠 Usage
-
-This package is intended to be used as a dependency in other Pinchana components. It is managed by `uv`.
-
-### Installation (as a submodule)
-```bash
-uv add ../pinchana-core
+```sh
+uv sync --frozen
+uv run python -c "import pinchana_core; print('pinchana_core imported')"
 ```
 
----
+Other repository modules consume this package through a local uv path dependency. Docker builds must use the parent `pinchana-api` directory as their build context because module Dockerfiles copy both this package and the selected service.
 
-## 📜 License
+## Security notes
 
-MIT
+Treat cached media as private operational data. Do not expose arbitrary cache paths, Gluetun control port 8000, or Docker lifecycle operations to the public Internet. `CONTAINER_MODE=false` disables lifecycle routes but does not remove an existing Docker socket mount.
+
+## License
+
+MIT. See `LICENSE` in the repository root.
