@@ -13,15 +13,38 @@ class VpnRotationError(Exception):
     pass
 
 
+class VpnRotationCooldownError(VpnRotationError):
+    """Raised when callers request a reconnect before its cooldown expires."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = max(0.0, retry_after)
+        super().__init__(
+            f"VPN reconnect is cooling down; retry in {self.retry_after:.1f}s"
+        )
+
+
 class GluetunController:
     """Manage programmatic IP rotation via the Gluetun sidecar API."""
 
     ROTATION_COOLDOWN = 90  # seconds
 
-    def __init__(self, control_url: Optional[str] = None, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        control_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        rotation_cooldown: Optional[float] = None,
+    ):
         self.enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
         self.control_url = control_url or os.getenv("GLUETUN_CONTROL_URL", "http://localhost:8000")
         self.api_key = api_key or os.getenv("GLUETUN_API_KEY", "secret-key")
+        configured_cooldown = (
+            rotation_cooldown
+            if rotation_cooldown is not None
+            else float(
+                os.getenv("VPN_ROTATION_COOLDOWN_SECONDS", self.ROTATION_COOLDOWN)
+            )
+        )
+        self.rotation_cooldown = max(0.0, configured_cooldown)
         self._last_rotation = 0.0
         self._lock = asyncio.Lock()
 
@@ -103,20 +126,51 @@ class GluetunController:
             f"VPN failed to connect within {timeout}s after rotation — possible transient AUTH_FAILED"
         )
 
-    async def rotate_ip(self):
-        """Teardown and rebuild the VPN tunnel, verifying it actually comes up."""
+    async def rotate_ip(self, *, wait_for_cooldown: bool = False) -> Optional[str]:
+        """Reconnect the VPN tunnel and return its resulting public IP.
+
+        Gluetun reconnects the configured endpoint; it does not guarantee that
+        the provider assigns a different public IP. Callers can compare the
+        returned value with their previously observed IP when that matters.
+        """
         if not self.enabled:
             logger.info("VPN rotation skipped because VPN_ENABLED=false")
-            return
-        async with self._lock:
-            now = time.time()
-            elapsed = now - self._last_rotation
-            if elapsed < self.ROTATION_COOLDOWN:
-                logger.info(f"VPN rotation on cooldown ({int(elapsed)}s since last). Waiting for tunnel to stabilize...")
-                await asyncio.sleep(5)
-                return
+            return None
 
-            logger.info("Rate limit hit. Rotating VPN IP...")
+        requested_from_ip = await self.get_public_ip()
+        async with self._lock:
+            current_ip = await self.get_public_ip()
+            if requested_from_ip and current_ip and current_ip != requested_from_ip:
+                logger.info(
+                    "VPN egress already changed while reconnect request was queued: %s -> %s",
+                    requested_from_ip,
+                    current_ip,
+                )
+                return current_ip
+
+            now = time.monotonic()
+            elapsed = now - self._last_rotation
+            if elapsed < self.rotation_cooldown:
+                retry_after = self.rotation_cooldown - elapsed
+                if not wait_for_cooldown:
+                    raise VpnRotationCooldownError(retry_after)
+                logger.info(
+                    "VPN reconnect on cooldown; waiting %.1fs before reconnecting",
+                    retry_after,
+                )
+                await asyncio.sleep(retry_after)
+
+                current_ip = await self.get_public_ip()
+                if requested_from_ip and current_ip and current_ip != requested_from_ip:
+                    logger.info(
+                        "VPN egress changed during cooldown wait: %s -> %s",
+                        requested_from_ip,
+                        current_ip,
+                    )
+                    return current_ip
+
+            previous_ip = current_ip or requested_from_ip
+            logger.info("Rate limit hit. Reconnecting VPN tunnel...")
             client = self._client()
             try:
                 stop_resp = await client.put("/v1/vpn/status", json={"status": "stopped"})
@@ -131,8 +185,20 @@ class GluetunController:
                 # Wait until the tunnel is actually connected instead of blind sleep
                 await self.wait_for_connection(timeout=60.0, interval=2.0)
 
-                self._last_rotation = time.time()
-                logger.info("VPN IP rotation completed.")
+                current_ip = await self.get_public_ip()
+                self._last_rotation = time.monotonic()
+                if previous_ip and current_ip == previous_ip:
+                    logger.warning(
+                        "VPN tunnel reconnected but public IP did not change: %s",
+                        current_ip,
+                    )
+                else:
+                    logger.info(
+                        "VPN tunnel reconnected; public IP: %s -> %s",
+                        previous_ip or "unknown",
+                        current_ip or "unknown",
+                    )
+                return current_ip
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (401, 403):
                     logger.error(f"Gluetun auth failed ({e.response.status_code}). Check GLUETUN_API_KEY.")

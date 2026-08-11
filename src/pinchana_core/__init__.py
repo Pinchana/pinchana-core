@@ -5,7 +5,7 @@ from .models import MediaItem, TrackItem, ScrapeRequest, ScrapeResponse
 from .music import MusicDownloader, MusicDownloadError
 from .plugins import PluginRegistry, ScraperPlugin, registry
 from .storage import MediaStorage
-from .vpn import GluetunController, VpnRotationError
+from .vpn import GluetunController, VpnRotationCooldownError, VpnRotationError
 
 __all__ = [
     "MediaItem",
@@ -16,6 +16,7 @@ __all__ = [
     "MusicDownloader",
     "MusicDownloadError",
     "GluetunController",
+    "VpnRotationCooldownError",
     "VpnRotationError",
     "PluginRegistry",
     "ScraperPlugin",
