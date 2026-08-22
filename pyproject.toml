@@ -1,6 +1,6 @@
 [project]
 name = "pinchana-core"
-version = "0.2b0"
+version = "26.8.1"
 description = "Shared models, storage, and VPN controller for scraper services"
 readme = "README.md"
 requires-python = ">=3.13"
