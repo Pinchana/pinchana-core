@@ -691,7 +691,7 @@ wheels = [
 
 [[package]]
 name = "pinchana-core"
-version = "26.8.4"
+version = "26.8.5"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
