@@ -1,6 +1,6 @@
 [project]
 name = "pinchana-core"
-version = "26.8.1"
+version = "26.8.2"
 description = "Shared models, storage, and VPN controller for scraper services"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -13,7 +13,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "starlette>=1.6.0,<2.0.0",
     "tenacity>=9.1.4",
-    "yt-dlp>=2026.8.19",
+    "yt-dlp[default,deno]>=2026.8.19",
 ]
 
 [build-system]
