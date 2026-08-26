@@ -1,0 +1,40 @@
+name: One-shot 26.8.7 version bump
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.release-trigger-26.8.7'
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          python-version: '3.13'
+      - name: Bump package version and lockfile
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('pyproject.toml')
+          text = path.read_text()
+          old = 'version = "26.8.6"'
+          new = 'version = "26.8.7"'
+          if old not in text:
+              raise SystemExit('expected 26.8.6 project version')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          uv lock --no-progress
+      - name: Commit bump
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add pyproject.toml uv.lock
+          git diff --cached --quiet && exit 0
+          git commit -m 'release: 26.8.7'
+          git push origin HEAD:main
