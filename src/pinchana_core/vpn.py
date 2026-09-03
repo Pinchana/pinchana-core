@@ -1,9 +1,11 @@
-import httpx
-import logging
 import asyncio
+import logging
 import os
+import socket
 import time
 from typing import Optional
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +29,16 @@ class GluetunController:
     """Manage programmatic IP rotation via the Gluetun sidecar API."""
 
     ROTATION_COOLDOWN = 90  # seconds
+    DNS_PROBE_HOSTNAME = "cloudflare.com"
+    DNS_PROBE_TIMEOUT = 5.0
 
     def __init__(
         self,
         control_url: Optional[str] = None,
         api_key: Optional[str] = None,
         rotation_cooldown: Optional[float] = None,
+        dns_probe_hostname: Optional[str] = None,
+        dns_probe_timeout: Optional[float] = None,
     ):
         self.enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
         self.control_url = control_url or os.getenv("GLUETUN_CONTROL_URL", "http://localhost:8000")
@@ -45,6 +51,15 @@ class GluetunController:
             )
         )
         self.rotation_cooldown = max(0.0, configured_cooldown)
+        self.dns_probe_hostname = dns_probe_hostname or os.getenv(
+            "VPN_DNS_PROBE_HOSTNAME", self.DNS_PROBE_HOSTNAME
+        )
+        configured_probe_timeout = (
+            dns_probe_timeout
+            if dns_probe_timeout is not None
+            else float(os.getenv("VPN_DNS_PROBE_TIMEOUT_SECONDS", self.DNS_PROBE_TIMEOUT))
+        )
+        self.dns_probe_timeout = max(0.1, configured_probe_timeout)
         self._last_rotation = 0.0
         self._lock = asyncio.Lock()
 
@@ -59,22 +74,102 @@ class GluetunController:
             timeout=15.0,
         )
 
-    async def get_vpn_status(self) -> dict:
-        """Fetch current VPN status from Gluetun."""
-        if not self.enabled:
-            return {"status": "disabled", "enabled": False}
+    async def _control_status(self, path: str, label: str) -> dict:
         client = self._client()
         try:
-            resp = await client.get("/v1/vpn/status")
+            resp = await client.get(path)
             resp.raise_for_status()
             data = resp.json()
             if not isinstance(data, dict):
                 raise VpnRotationError(
-                    f"Gluetun /v1/vpn/status returned non-dict JSON ({type(data).__name__}): {data!r}"
+                    f"Gluetun {label} endpoint returned non-dict JSON "
+                    f"({type(data).__name__})"
                 )
             return data
+        except VpnRotationError:
+            raise
+        except httpx.HTTPError as exc:
+            raise VpnRotationError(
+                f"Failed to query Gluetun {label} status: {exc}"
+            ) from exc
         finally:
             await client.aclose()
+
+    async def _probe_dns(self) -> dict:
+        loop = asyncio.get_running_loop()
+        try:
+            records = await asyncio.wait_for(
+                loop.getaddrinfo(
+                    self.dns_probe_hostname,
+                    443,
+                    family=socket.AF_INET,
+                    type=socket.SOCK_STREAM,
+                ),
+                timeout=self.dns_probe_timeout,
+            )
+        except (TimeoutError, OSError) as exc:
+            return {
+                "status": "degraded",
+                "hostname": self.dns_probe_hostname,
+                "error": str(exc) or type(exc).__name__,
+            }
+
+        addresses = sorted({record[4][0] for record in records if record[4]})
+        if not addresses:
+            return {
+                "status": "degraded",
+                "hostname": self.dns_probe_hostname,
+                "error": "resolver returned no IPv4 addresses",
+            }
+        return {
+            "status": "running",
+            "hostname": self.dns_probe_hostname,
+            "addresses": addresses,
+        }
+
+    async def get_dns_status(self) -> dict:
+        """Return Gluetun DNS state plus a real resolver probe."""
+        if not self.enabled:
+            return {"status": "disabled", "enabled": False}
+
+        try:
+            control = await self._control_status("/v1/dns/status", "DNS")
+        except VpnRotationError as exc:
+            return {"status": "degraded", "control": "unavailable", "error": str(exc)}
+
+        control_status = str(control.get("status", "unknown")).lower()
+        if control_status != "running":
+            return {"status": "degraded", "control": control_status}
+
+        probe = await self._probe_dns()
+        return {
+            "status": probe["status"],
+            "control": control_status,
+            "probe": probe,
+        }
+
+    async def get_vpn_status(self) -> dict:
+        """Fetch VPN, Gluetun DNS, and resolver readiness.
+
+        The top-level status remains ``running`` only when the tunnel and DNS
+        are both ready. Existing service health checks therefore fail closed
+        when Gluetun's DNS process is stopped or real resolution is broken.
+        """
+        if not self.enabled:
+            return {"status": "disabled", "enabled": False}
+
+        data = await self._control_status("/v1/vpn/status", "VPN")
+        vpn_status = str(data.get("status", "unknown")).lower()
+        result = dict(data)
+        result["vpn_status"] = vpn_status
+        if vpn_status != "running":
+            return result
+
+        dns = await self.get_dns_status()
+        result["dns"] = dns
+        if dns.get("status") != "running":
+            result["status"] = "degraded"
+        return result
 
     async def get_public_ip(self) -> Optional[str]:
         """Fetch current public IP from Gluetun."""
@@ -97,28 +192,21 @@ class GluetunController:
         """Poll Gluetun until the VPN is connected or timeout expires."""
         if not self.enabled:
             return {"status": "disabled", "enabled": False}
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
                 status = await self.get_vpn_status()
                 vpn_status = status.get("status", "").lower()
 
                 if vpn_status == "running":
-                    # Verification: ensure we can actually get a public IP.
-                    # Gluetun reports 'running' as soon as the process starts,
-                    # but the tunnel might still be performing MTU discovery or IP assignment.
+                    # get_vpn_status already verified the Gluetun DNS process
+                    # and a real hostname lookup. Also require public egress.
                     ip = await self.get_public_ip()
                     if ip:
                         logger.info(f"VPN connected. Public IP: {ip}")
                         return status
 
                 logger.debug(f"VPN not ready yet: status={vpn_status}")
-            except httpx.HTTPStatusError as e:
-                logger.debug(f"HTTP error polling VPN status: {e.response.status_code}")
-            except httpx.ConnectError:
-                logger.debug("Gluetun control server not reachable yet.")
-            except httpx.HTTPError as e:
-                logger.debug(f"Error polling VPN status: {e}")
             except VpnRotationError as e:
                 logger.debug(f"VPN rotation polling issue: {e}")
             await asyncio.sleep(interval)
@@ -126,7 +214,12 @@ class GluetunController:
             f"VPN failed to connect within {timeout}s after rotation — possible transient AUTH_FAILED"
         )
 
-    async def rotate_ip(self, *, wait_for_cooldown: bool = False) -> Optional[str]:
+    async def rotate_ip(
+        self,
+        *,
+        wait_for_cooldown: bool = False,
+        reason: str = "upstream block or connectivity failure",
+    ) -> Optional[str]:
         """Reconnect the VPN tunnel and return its resulting public IP.
 
         Gluetun reconnects the configured endpoint; it does not guarantee that
@@ -170,7 +263,7 @@ class GluetunController:
                     return current_ip
 
             previous_ip = current_ip or requested_from_ip
-            logger.info("Rate limit hit. Reconnecting VPN tunnel...")
+            logger.info("Reconnecting VPN tunnel: %s", reason)
             client = self._client()
             try:
                 stop_resp = await client.put("/v1/vpn/status", json={"status": "stopped"})
@@ -204,12 +297,16 @@ class GluetunController:
                     logger.error(f"Gluetun auth failed ({e.response.status_code}). Check GLUETUN_API_KEY.")
                 else:
                     logger.error(f"Gluetun control API error: {e.response.status_code}")
-                raise
-            except httpx.ConnectError:
+                raise VpnRotationError(
+                    f"Gluetun control API returned HTTP {e.response.status_code}"
+                ) from e
+            except httpx.ConnectError as e:
                 logger.error("Cannot connect to Gluetun control server. Is Gluetun running?")
-                raise
+                raise VpnRotationError("Cannot connect to Gluetun control server") from e
             except httpx.HTTPError as e:
                 logger.error(f"Failed to communicate with Gluetun control server: {e}")
-                raise
+                raise VpnRotationError(
+                    f"Failed to communicate with Gluetun control server: {e}"
+                ) from e
             finally:
                 await client.aclose()
