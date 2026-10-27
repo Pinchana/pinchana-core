@@ -1,10 +1,20 @@
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, HttpUrl, Field, model_validator
 from typing import Optional, List
+
+from .storage import set_cache_scope
 
 
 class ScrapeRequest(BaseModel):
     """Client payload specifying the target URL."""
     url: HttpUrl = Field(..., description="The complete Instagram Post, Reel, or Carousel URL.")
+    cache_scope: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+
+    @model_validator(mode="after")
+    def activate_cache_scope(self):
+        # FastAPI validates the request in its own async task before invoking
+        # scraper code. Scope must never bleed into the next scrape request.
+        set_cache_scope(self.cache_scope)
+        return self
 
 
 class MediaItem(BaseModel):

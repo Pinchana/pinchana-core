@@ -5,6 +5,7 @@ import os
 import shutil
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Dict, TypeVar
 import httpx
@@ -12,13 +13,21 @@ import httpx
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
+# A gateway-issued scope isolates one Telegram delivery from the persistent
+# scraper cache. Requests without a scope keep all previous cache semantics.
+_cache_scope: ContextVar[str | None] = ContextVar("pinchana_cache_scope", default=None)
+
+
+def set_cache_scope(value: str | None) -> None:
+    _cache_scope.set(value)
+
 
 class MediaStorage:
     """Persistent on-disk storage for scraped media with size-based eviction."""
 
     def __init__(self, base_path: str = "./cache", max_size_gb: float = 10.0):
-        self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
+        self._base_path = Path(base_path)
+        self._base_path.mkdir(parents=True, exist_ok=True)
         self.max_size_bytes = int(max_size_gb * 1024 * 1024 * 1024)
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_lock = asyncio.Lock()
@@ -27,6 +36,15 @@ class MediaStorage:
         )
         self._inflight: dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
+
+    @property
+    def base_path(self) -> Path:
+        scope = _cache_scope.get()
+        if scope:
+            ephemeral_path = self._base_path / ".transient" / scope
+            ephemeral_path.mkdir(parents=True, exist_ok=True)
+            return ephemeral_path
+        return self._base_path
 
     async def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -46,6 +64,9 @@ class MediaStorage:
 
     async def singleflight(self, key: str, operation: Callable[[], Awaitable[T]]) -> T:
         """Run at most one operation for a cache key and share its result."""
+        scope = _cache_scope.get()
+        if scope:
+            key = f"transient:{scope}:{key}"
         async with self._inflight_lock:
             task = self._inflight.get(key)
             if task is None:
@@ -154,11 +175,16 @@ class MediaStorage:
             f.stat().st_size
             for f in self.base_path.rglob("*")
             if f.is_file()
+            and (f.is_relative_to(self.base_path / ".transient") is False
+                 or _cache_scope.get() is not None)
         )
 
     def _evict_if_needed(self, needed_bytes: int = 0):
         while self._total_size() + needed_bytes > self.max_size_bytes:
-            dirs = [d for d in self.base_path.iterdir() if d.is_dir()]
+            dirs = [
+                d for d in self.base_path.iterdir()
+                if d.is_dir() and (d.name != ".transient" or _cache_scope.get() is not None)
+            ]
             if not dirs:
                 break
 
