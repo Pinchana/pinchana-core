@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import aiohttp
 from PIL import Image
@@ -84,15 +84,21 @@ class MusicDownloader:
 
     def __init__(
         self,
-        base_dir: str | Path,
+        base_dir: str | Path | Callable[[], str | Path],
         proxy: str | None = None,
         gluetun: GluetunController | None = None,
     ):
-        self.base_dir = Path(base_dir)
+        self._base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.proxy = proxy
         self.cookies_path = self._find_cookies()
         self.gluetun = gluetun or GluetunController()
+
+    @property
+    def base_dir(self) -> Path:
+        """Resolve lazy storage paths in the current request cache scope."""
+        value = self._base_dir() if callable(self._base_dir) else self._base_dir
+        return Path(value)
 
     # ------------------------------------------------------------------
     # Subclass hooks
